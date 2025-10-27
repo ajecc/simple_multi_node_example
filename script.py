@@ -42,20 +42,34 @@ def main():
     # ----- Tiny synthetic classification problem -----
     torch.manual_seed(0)
     X = torch.randn(args.num_samples, args.in_dim)
-    # Linear rule with noise to give the model something to learn
     true_W = torch.randn(args.in_dim, args.num_classes)
     logits = X @ true_W + 0.1 * torch.randn(args.num_samples, args.num_classes)
     y = logits.argmax(dim=1)
 
+    # Ensure equal steps across ranks: trim to multiple of world_size * batch_size
+    global_bs = world_size * args.batch_size
+    usable = (len(X) // global_bs) * global_bs
+    if usable == 0:
+        raise ValueError(
+            f"num_samples={len(X)} too small for world_size*batch_size={global_bs}"
+        )
+    if usable != len(X) and is_main:
+        print(f"Trimming dataset from {len(X)} to {usable} samples for even batching.")
+    X, y = X[:usable], y[:usable]
+
     dataset = TensorDataset(X, y)
-    sampler = DistributedSampler(dataset, shuffle=True, drop_last=True)
+    sampler = DistributedSampler(
+        dataset,
+        shuffle=True,
+        drop_last=True,  # <-- critical to avoid uneven final batches
+    )
     loader = DataLoader(
         dataset,
         batch_size=args.batch_size,
         sampler=sampler,
         num_workers=2,
         pin_memory=True,
-        drop_last=True,
+        drop_last=True,  # matches sampler behavior
     )
 
     # ----- Simple MLP -----
@@ -65,18 +79,23 @@ def main():
         nn.Linear(256, args.num_classes),
     ).to(device)
 
-    ddp_model = DDP(model, device_ids=[local_rank], output_device=local_rank)
+    ddp_model = DDP(
+        model,
+        device_ids=[local_rank],
+        output_device=local_rank,
+        find_unused_parameters=False,
+    )
 
     criterion = nn.CrossEntropyLoss().to(device)
     optimizer = Adam(ddp_model.parameters(), lr=args.lr)
 
     if is_main:
         print(f"[World {world_size}] Starting training on {torch.cuda.get_device_name(device)}")
-    dist.barrier()
+    dist.barrier()  # sync before starting
 
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
-        sampler.set_epoch(epoch)  # ensures different shuffles across epochs across ranks
+        sampler.set_epoch(epoch)
         running_loss = 0.0
         n_batches = 0
 
@@ -93,20 +112,19 @@ def main():
             running_loss += loss.item()
             n_batches += 1
 
-        # Average the epoch loss across all ranks for consistent logging
+        # Average the epoch loss across all ranks
         loss_tensor = torch.tensor([running_loss / max(n_batches, 1)], device=device)
         dist.all_reduce(loss_tensor, op=dist.ReduceOp.AVG)
         if is_main:
             print(f"Epoch {epoch:02d} | loss={loss_tensor.item():.4f} | time={time.time()-epoch_start:.2f}s")
 
-    # Save only from rank 0
+    # Sync before saving to avoid teardown races
+    dist.barrier()
     if is_main:
         os.makedirs("checkpoints", exist_ok=True)
-        torch.save(
-            {"model": ddp_model.module.state_dict()},
-            "checkpoints/model.pt",
-        )
+        torch.save({"model": ddp_model.module.state_dict()}, "checkpoints/model.pt")
         print("Saved checkpoints/model.pt")
+    dist.barrier()
 
     cleanup_distributed()
 
