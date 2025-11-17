@@ -7,6 +7,7 @@ from torch import nn
 from torch.optim import Adam
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import TensorDataset, DataLoader, DistributedSampler
+from clearml import Task
 
 def parse_args():
     p = argparse.ArgumentParser()
@@ -33,6 +34,7 @@ def cleanup_distributed():
         dist.destroy_process_group()
 
 def main():
+    Task.init("Multi Node Pytorch", "Multi Node Pytorch")
     args = parse_args()
     torch.backends.cudnn.benchmark = True
 
